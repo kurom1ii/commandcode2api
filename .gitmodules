@@ -1,0 +1,3 @@
+[submodule "refs"]
+	path = refs
+	url = https://github.com/patlux/pi-commandcode-provider.git
