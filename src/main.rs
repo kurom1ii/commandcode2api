@@ -31,6 +31,7 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
+    let host: String = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -53,7 +54,9 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .expect("Invalid HOST or PORT");
     tracing::info!("Listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
