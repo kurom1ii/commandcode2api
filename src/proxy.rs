@@ -83,7 +83,9 @@ fn build_cc_request(
         .map(|s| s.clone())
         .unwrap_or_else(|| extract_system(&req.messages));
     let max_tokens = req.max_tokens.unwrap_or(8192).min(200_000);
-    let stream = req.stream.unwrap_or(false);
+    // CommandCode API always requires stream=true; we buffer for non-streaming clients
+    let _client_stream = req.stream.unwrap_or(false);
+    let stream = true;
 
     CcRequest {
         config: CcConfig {

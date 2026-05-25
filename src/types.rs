@@ -304,6 +304,7 @@ pub struct ProviderGroup {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelDef {
     pub key: String,
     pub id: String,
@@ -322,6 +323,7 @@ pub struct ModelDef {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PricingEntry {
     pub provider: String,
     pub id: String,
