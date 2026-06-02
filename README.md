@@ -80,13 +80,78 @@ for chunk in response:
 
 ## 支持的模型
 
-启动时自动从 GitHub 拉取 [ninehills/pi-commandcode-provider](https://github.com/ninehills/pi-commandcode-provider) 仓库里最新的 `models.json`，包含 18+ 个模型：Claude、GPT、DeepSeek、Kimi、GLM、MiniMax、Qwen、Gemini、Step 等。
+模型列表通过 `scripts/extract-models.js` 从官方 `command-code` npm 包的 `dist/index.mjs` bundle 中提取生成 `models.json`（解决了原 GitHub 仓库 404 的问题）。
 
-- 成功则解析并**缓存到本地 `models.json`**，方便下次离线启动
-- 拉取失败则回退到本地缓存（如果存在）
-- 两者都失败则返回空列表，服务仍可启动
+- 运行 `node scripts/extract-models.js` 可**更新**本地 `models.json`（基于最新发布的 CLI 版本）。
+- 服务启动时优先尝试远程加载（当前上游地址已 404），失败则回退使用本地的 `models.json`。
+- 两者都失败则返回空列表，但服务仍可启动（可直接传入 model id 调用上游）。
 
 ```bash
-# 手动刷新模型列表（重启服务即可）
+# 更新模型列表（然后重启服务）
+node scripts/extract-models.js
+
+# 查看当前可用模型
 curl http://localhost:3000/v1/models
 ```
+
+### 当前可用模型（共 26 个）
+
+按系列分组（可直接在 `model` 参数中使用这些 ID）：
+
+**Claude 系列 (Anthropic)**
+
+- `claude-sonnet-4-6`
+- `claude-opus-4-8`
+- `claude-opus-4-7`
+- `claude-haiku-4-5-20251001`
+
+**GPT 系列 (OpenAI)**
+
+- `gpt-5.5`
+- `gpt-5.4`
+- `gpt-5.4-mini`
+- `gpt-5.3-codex`
+
+**DeepSeek**
+
+- `deepseek/deepseek-v4-flash`
+- `deepseek/deepseek-v4-pro`
+
+**Gemini (Google)**
+
+- `google/gemini-3.5-flash`
+- `google/gemini-3.1-flash-lite`
+
+**Qwen 系列 (Alibaba)**
+
+- `Qwen/Qwen3.7-Max`
+- `Qwen/Qwen3.6-Max-Preview`
+- `Qwen/Qwen3.6-Plus`
+
+**Kimi 系列 (Moonshot)**
+
+- `moonshotai/Kimi-K2.6`
+- `moonshotai/Kimi-K2.5`
+
+**GLM 系列 (Zhipu / Z.ai)**
+
+- `zai-org/GLM-5.1`
+- `zai-org/GLM-5`
+
+**MiniMax**
+
+- `MiniMaxAI/MiniMax-M3`
+- `MiniMaxAI/MiniMax-M2.7`
+- `MiniMaxAI/MiniMax-M2.5`
+
+**Step 系列 (StepFun)**
+
+- `stepfun/Step-3.7-Flash`
+- `stepfun/Step-3.5-Flash`
+
+**MiMo 系列 (Xiaomi)**
+
+- `xiaomi/mimo-v2.5-pro`
+- `xiaomi/mimo-v2.5`
+
+> **说明**：大部分开放模型由 Command Code 托管提供（`owned_by` 通常为 `command-code`），Claude/GPT 部分可走原厂提供商。实际可用模型和额度取决于你的 CommandCode 账户。列表会随上游更新，请定期执行提取脚本并重启服务。

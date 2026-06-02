@@ -7,11 +7,89 @@ use axum::{
     Json,
 };
 use futures::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde_json::json;
-use std::{env, sync::Arc, time::SystemTime};
+use std::{env, error::Error, sync::Arc, time::SystemTime};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// Max retries for transient network errors.
+const MAX_RETRIES: u32 = 3;
+
+/// Check if an error is a transient network issue worth retrying.
+fn is_retryable_error(err: &reqwest::Error) -> bool {
+    if err.is_timeout() || err.is_connect() {
+        return true;
+    }
+    // Walk the error chain for io::ErrorKind::ConnectionReset
+    let mut source = err.source();
+    while let Some(s) = source {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        source = s.source();
+    }
+    false
+}
+
+/// Map a reqwest error to the appropriate HTTP status code.
+fn map_upstream_error(err: &reqwest::Error) -> StatusCode {
+    if err.is_timeout() {
+        return StatusCode::GATEWAY_TIMEOUT;
+    }
+    let mut source = err.source();
+    while let Some(s) = source {
+        if let Some(io_err) = s.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => {
+                    return StatusCode::BAD_GATEWAY;
+                }
+                _ => {}
+            }
+        }
+        source = s.source();
+    }
+    StatusCode::BAD_GATEWAY
+}
+
+/// Execute a POST request with exponential-backoff retry for transient errors.
+async fn retry_post_request(
+    build: impl Fn() -> RequestBuilder,
+    max_retries: u32,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        let builder = build();
+        match builder.send().await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                if !is_retryable_error(&e) || attempt == max_retries {
+                    return Err(e);
+                }
+                last_err = Some(e);
+                let delay = std::time::Duration::from_millis(500 * (1 << attempt));
+                tracing::warn!(
+                    "Upstream request failed (attempt {}/{}), retrying in {:?}: {}",
+                    attempt + 1,
+                    max_retries + 1,
+                    delay,
+                    last_err.as_ref().unwrap()
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
 
 const MODELS_JSON_URL: &str =
     "https://raw.githubusercontent.com/ninehills/pi-commandcode-provider/main/models.json";
@@ -171,24 +249,28 @@ pub async fn chat_completions(
     let url = format!("{}/alpha/generate", state.api_base);
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let cc_response = state
-        .client
-        .post(&url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("x-command-code-version", "0.24.1")
-        .header("x-cli-environment", "production")
-        .header("x-project-slug", "commandcode2api")
-        .header("x-taste-learning", "false")
-        .header("x-co-flag", "false")
-        .header("x-session-id", &session_id)
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("CC upstream request failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+    let cc_response = retry_post_request(
+        || {
+            state
+                .client
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("x-command-code-version", "0.24.1")
+                .header("x-cli-environment", "production")
+                .header("x-project-slug", "commandcode2api")
+                .header("x-taste-learning", "false")
+                .header("x-co-flag", "false")
+                .header("x-session-id", &session_id)
+                .body(body.clone())
+        },
+        MAX_RETRIES,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("CC upstream request failed after retries: {}", e);
+        map_upstream_error(&e)
+    })?;
 
     if !cc_response.status().is_success() {
         let status = cc_response.status();
@@ -362,24 +444,28 @@ pub async fn chat_completions_stream(
     let session_id = uuid::Uuid::new_v4().to_string();
     let model_id = req.model.clone();
 
-    let cc_response = state
-        .client
-        .post(&url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("x-command-code-version", "0.24.1")
-        .header("x-cli-environment", "production")
-        .header("x-project-slug", "commandcode2api")
-        .header("x-taste-learning", "false")
-        .header("x-co-flag", "false")
-        .header("x-session-id", &session_id)
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("CC upstream request failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+    let cc_response = retry_post_request(
+        || {
+            state
+                .client
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("x-command-code-version", "0.24.1")
+                .header("x-cli-environment", "production")
+                .header("x-project-slug", "commandcode2api")
+                .header("x-taste-learning", "false")
+                .header("x-co-flag", "false")
+                .header("x-session-id", &session_id)
+                .body(body.clone())
+        },
+        MAX_RETRIES,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("CC upstream request failed after retries: {}", e);
+        map_upstream_error(&e)
+    })?;
 
     if !cc_response.status().is_success() {
         let status = cc_response.status();

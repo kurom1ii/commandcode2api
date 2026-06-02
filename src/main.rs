@@ -34,7 +34,11 @@ async fn main() {
     let host: String = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
     let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(300))
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()
         .expect("Failed to build reqwest client");
 
