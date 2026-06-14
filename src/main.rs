@@ -1,7 +1,3 @@
-mod convert;
-mod proxy;
-mod types;
-
 use std::{env, net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -9,7 +5,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use proxy::{chat_completions_handler, load_models_json, AppState};
+use commandcode2api::proxy::{chat_completions_handler, load_models_json, messages_handler, AppState};
+use commandcode2api::types;
 use reqwest::Client;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -53,6 +50,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/messages", post(messages_handler))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         .layer(CorsLayer::permissive())

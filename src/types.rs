@@ -26,6 +26,10 @@ pub struct ChatCompletionRequest {
     pub user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
     // extra fields we ignore but accept for compatibility
     #[serde(flatten)]
     #[allow(dead_code)]
@@ -127,6 +131,10 @@ pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_miss_tokens: Option<u64>,
 }
 
 // Streaming response (SSE)
@@ -207,7 +215,11 @@ pub struct CcConfig {
 
 #[derive(Debug, Serialize)]
 pub struct CcParams {
-    pub model: String,
+    pub model: String,    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
     pub messages: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<serde_json::Value>,
@@ -215,6 +227,7 @@ pub struct CcParams {
     pub system: String,
     pub max_tokens: u64,
     pub stream: bool,
+
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,6 +381,8 @@ mod tests {
                 system: String::new(),
                 max_tokens: 500,
                 stream: true,
+                reasoning_effort: None,
+                thinking: None,
             },
         };
 
