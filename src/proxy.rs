@@ -564,7 +564,7 @@ pub async fn chat_completions_stream(
                         buf.push_str(&String::from_utf8_lossy(&chunk));
 
                         while let Some(pos) = buf.find('\n') {
-                            let line = buf[..pos].to_string();
+                            let line = buf[..pos].trim_end_matches('\r').to_string();
                             buf = buf[pos + 1..].to_string();
 
                             if let Some(event) = parse_cc_event_line(&line) {
@@ -1215,7 +1215,7 @@ async fn messages_stream(
                         buf.push_str(&String::from_utf8_lossy(&chunk));
 
                         while let Some(pos) = buf.find('\n') {
-                            let line = buf[..pos].to_string();
+                            let line = buf[..pos].trim_end_matches('\r').to_string();
                             buf = buf[pos + 1..].to_string();
 
                             if let Some(cc_event) = parse_cc_event_line(&line) {
@@ -1396,6 +1396,33 @@ async fn messages_stream(
                         break 'stream_retry;
                     }
                     None => {
+                        if !buf.is_empty() {
+                            if let Some(event) = parse_cc_event_line(&buf) {
+                                if event.event_type == "finish" {
+                                    let finish = map_finish_reason(event.finish_reason.as_deref());
+                                    let oai_usage = event
+                                        .total_usage
+                                        .map(usage_from_cc_usage)
+                                        .filter(|u| u.total_tokens > 0);
+                                    let chunk = ChatCompletionChunk {
+                                        id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                                        object: "chat.completion.chunk".to_string(),
+                                        created,
+                                        model: anthropic_req.model.clone(),
+                                        choices: vec![ChunkChoice {
+                                            index: 0,
+                                            delta: ChunkDelta::default(),
+                                            finish_reason: finish,
+                                        }],
+                                        usage: oai_usage,
+                                    };
+                                    for ev in translate_api::openai_chunk_to_anthropic_events(&chunk, &mut translate_state) {
+                                        let _ = tx.send(Ok(anthropic_sse_event(&ev))).await;
+                                    }
+                                    stream_success = true;
+                                }
+                            }
+                        }
                         break 'read_stream;
                     }
                 }
