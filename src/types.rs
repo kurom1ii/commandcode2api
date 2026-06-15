@@ -118,7 +118,6 @@ pub struct Choice {
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionMessage {
     pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -230,7 +229,7 @@ pub struct CcParams {
 
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CcStreamEvent {
     #[serde(rename = "type")]
     pub event_type: String,
@@ -258,7 +257,7 @@ pub struct CcStreamEvent {
     pub total_usage: Option<CcUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CcUsage {
     #[serde(default)]
     #[serde(rename = "inputTokens")]
@@ -271,7 +270,7 @@ pub struct CcUsage {
     pub input_token_details: Option<CcTokenDetails>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CcTokenDetails {
     #[serde(default)]
     #[serde(rename = "cacheReadTokens")]

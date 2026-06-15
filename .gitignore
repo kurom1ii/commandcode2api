@@ -4,3 +4,6 @@ Cargo.lock
 data/
 .codegraph/
 .claude/
+.mcp.json
+task_progress.json
+.gitgnore

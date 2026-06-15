@@ -15,7 +15,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Max retries for transient network errors.
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 5;
+/// Max mid-stream retries (stream died without finish, dead connection, etc.)
+const MID_STREAM_MAX_RETRIES: u32 = 5;
+/// Timeout waiting for next SSE chunk from CC before considering stream dead.
+const CHUNK_TIMEOUT_SECS: u64 = 20;
 
 /// Check if an error is a transient network issue worth retrying.
 fn is_retryable_error(err: &reqwest::Error) -> bool {
@@ -66,6 +70,150 @@ fn log_error_body_if_network_lost(text: &str) {
     let lower = text.to_lowercase();
     if lower.contains("network connection lost") || lower.contains("connection lost") {
         eprintln!("[NETWORK] CC API response indicates network connection lost: {}", text);
+    }
+}
+
+struct CcResponseDumper {
+    path: std::path::PathBuf,
+    buf: String,
+    created: i64,
+    model: String,
+    stream: bool,
+    // Accumulated fields
+    text: String,
+    reasoning: String,
+    tool_calls: Vec<serde_json::Value>,
+    usage: Option<serde_json::Value>,
+    finish_reason: Option<String>,
+    event_count: usize,
+}
+
+impl CcResponseDumper {
+    fn new(label: &str, stream: bool, model: &str) -> Option<Self> {
+        let now = chrono::Local::now();
+        let date_dir = now.format("%d-%m-%Y").to_string();
+        let dump_dir = format!("data/{}/cc_responses", date_dir);
+        let _ = std::fs::create_dir_all(&dump_dir);
+        let ts = now.format("%d-%m-%Y_%H-%M-%S%.3f").to_string();
+        let path = std::path::PathBuf::from(format!("{}/cc_resp_{}_{}.json", dump_dir, label, ts));
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        Some(Self {
+            path,
+            buf: String::new(),
+            created,
+            model: model.to_string(),
+            stream,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: None,
+            event_count: 0,
+        })
+    }
+
+    fn feed_bytes(&mut self, raw_bytes: &[u8]) {
+        self.buf.push_str(&String::from_utf8_lossy(raw_bytes));
+        while let Some(pos) = self.buf.find('\n') {
+            let line = self.buf[..pos].trim_end_matches('\r').to_string();
+            self.buf = self.buf[pos + 1..].to_string();
+            if line.is_empty() { continue; }
+            if let Some(event) = parse_cc_event_line(&line) {
+                self.process_event(&event);
+            }
+        }
+    }
+
+    fn feed_full_body(&mut self, body: &str) {
+        for line in body.lines() {
+            let line = line.trim().to_string();
+            if line.is_empty() { continue; }
+            if let Some(event) = parse_cc_event_line(&line) {
+                self.process_event(&event);
+            }
+        }
+    }
+
+    fn process_event(&mut self, event: &CcStreamEvent) {
+        self.event_count += 1;
+        match event.event_type.as_str() {
+            "text-delta" => {
+                if let Some(ref t) = event.text { self.text.push_str(t); }
+            }
+            "reasoning-delta" => {
+                if let Some(ref t) = event.text { self.reasoning.push_str(t); }
+            }
+            "tool-call" => {
+                let id = event.tool_call_id.clone().unwrap_or_default();
+                let name = event.tool_name.clone().unwrap_or_default();
+                let args = event.input.as_ref()
+                    .or(event.args.as_ref())
+                    .or(event.arguments.as_ref())
+                    .map(|v| serde_json::to_string(v).unwrap_or_default())
+                    .unwrap_or_default();
+                self.tool_calls.push(serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": args,
+                    }
+                }));
+            }
+            "finish" => {
+                self.finish_reason = event.finish_reason.clone();
+                if let Some(ref u) = event.total_usage {
+                    self.usage = Some(serde_json::json!({
+                        "prompt_tokens": u.input_tokens.unwrap_or(0),
+                        "completion_tokens": u.output_tokens.unwrap_or(0),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finalize(&mut self) {
+        let content = if self.text.is_empty() { None } else { Some(&self.text) };
+        let reasoning_content = if self.reasoning.is_empty() { None } else { Some(&self.reasoning) };
+        let tool_calls = if self.tool_calls.is_empty() { None } else { Some(&self.tool_calls) };
+
+        let message = {
+            let mut m = serde_json::json!({ "role": "assistant" });
+            if let Some(c) = content { m["content"] = serde_json::Value::from(c.as_str()); }
+            if let Some(r) = reasoning_content { m["reasoning_content"] = serde_json::Value::from(r.as_str()); }
+            if let Some(tc) = tool_calls { m["tool_calls"] = serde_json::Value::from(tc.as_slice()); }
+            m
+        };
+
+        let usage = &self.usage;
+        let finish_reason = &self.finish_reason;
+
+        let report = serde_json::json!({
+            "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+            "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            "object": "chat.completion",
+            "created": self.created,
+            "model": self.model,
+            "stream": self.stream,
+            "total_events": self.event_count,
+            "choices": [{
+                "index": 0,
+                "finish_reason": finish_reason,
+                "message": message,
+            }],
+            "usage": usage,
+        });
+        let _ = std::fs::write(&self.path, serde_json::to_string_pretty(&report).unwrap_or_default());
+    }
+}
+
+impl Drop for CcResponseDumper {
+    fn drop(&mut self) {
+        self.finalize();
     }
 }
 
@@ -206,10 +354,12 @@ pub(crate) fn build_cc_request(
         },
     };
 
-    // Dump full JSON to data/ for debugging
-    let dump_dir = "data";
-    let _ = std::fs::create_dir_all(dump_dir);
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    // Dump full JSON to data/{date}/cc_requests/ for debugging
+    let now = chrono::Local::now();
+    let date_dir = now.format("%d-%m-%Y").to_string();
+    let dump_dir = format!("data/{}/cc_requests", date_dir);
+    let _ = std::fs::create_dir_all(&dump_dir);
+    let timestamp = now.format("%d-%m-%Y_%H-%M-%S").to_string();
     let dump_path = format!("{}/cc_req_{}.json", dump_dir, timestamp);
     if let Ok(json) = serde_json::to_string_pretty(&cc_req) {
         let _ = std::fs::write(&dump_path, &json);
@@ -250,7 +400,25 @@ fn usage_from_cc_usage(cc_usage: CcUsage) -> Usage {
     usage
 }
 
-/// Non-streaming completion handler.
+/// Dangling-intent detection: checks if assistant text/thought ends mid-sentence.
+fn ends_with_dangling_intent(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() { return false; }
+    if t.ends_with(':') { return true; }
+    let lower = t.to_lowercase();
+    let phrases = [
+        "let me", "let's", "i'll", "i will",
+        "i'm going to", "i am going to", "we'll", "we will",
+    ];
+    for phrase in &phrases {
+        if lower.ends_with(phrase) || lower.ends_with(&format!("{} ", phrase)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Non-streaming completion handler with recovery loop.
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -268,175 +436,228 @@ pub async fn chat_completions(
         env!("CARGO_PKG_VERSION")
     );
 
-    let cc_req = build_cc_request(&req, &working_dir, &environment);
-    let body = serde_json::to_string(&cc_req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let model_id = req.model.clone();
+    let mut cc_req = build_cc_request(&req, &working_dir, &environment);
+    cc_req.params.stream = true;
 
-    let url = format!("{}/alpha/generate", state.api_base);
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut nudge_count = 0u32;
+    let mut length_count = 0u32;
+    let mut intent_count = 0u32;
+    const MAX_EMPTY_TURNS: u32 = 8;
 
-    let cc_response = retry_post_request(
-        || {
-            state
-                .client
-                .post(&url)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("x-command-code-version", "0.24.1")
-                .header("x-cli-environment", "production")
-                .header("x-project-slug", "commandcode2api")
-                .header("x-taste-learning", "false")
-                .header("x-co-flag", "false")
-                .header("x-session-id", &session_id)
-                .body(body.clone())
-        },
-        MAX_RETRIES,
-    )
-    .await
-    .map_err(|e| {
-        eprintln!("[ERROR] Non-stream POST failed after all retries: {}", e);
-        map_upstream_error(&e)
-    })?;
+    'recovery_loop: loop {
+        let body = serde_json::to_string(&cc_req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let url = format!("{}/alpha/generate", state.api_base);
+        let session_id = uuid::Uuid::new_v4().to_string();
 
-    if !cc_response.status().is_success() {
-        let status = cc_response.status();
-        let text = cc_response
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(500)
-            .collect::<String>();
-        log_error_body_if_network_lost(&text);
-        eprintln!("[ERROR] CC API returned HTTP {}: {}", status, text);
-        return Ok((
-            StatusCode::BAD_GATEWAY,
-            format!("CommandCode API error {}: {}", status, text),
+        let cc_response = retry_post_request(
+            || {
+                state
+                    .client
+                    .post(&url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("x-command-code-version", "0.37.2")
+                    .header("x-cli-environment", "production")
+                    .header("x-project-slug", "commandcode2api")
+                    .header("x-taste-learning", "false")
+                    .header("x-co-flag", "false")
+                    .header("x-session-id", &session_id)
+                    .body(body.clone())
+            },
+            MAX_RETRIES,
         )
-            .into_response());
-    }
-
-    // For non-streaming, we still receive an SSE stream from CC and buffer it.
-    let bytes = cc_response
-        .bytes()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let text = String::from_utf8_lossy(&bytes);
+        .map_err(|e| {
+            eprintln!("[ERROR] Non-stream POST failed after all retries: {}", e);
+            map_upstream_error(&e)
+        })?;
 
-    let mut full_text = String::new();
-    let mut reasoning_text = String::new();
-    let mut tool_calls: Vec<ToolCall> = vec![];
-    let mut usage = Usage::default();
-    let mut finish_reason: Option<String> = None;
-    let mut finished = false;
+        if !cc_response.status().is_success() {
+            let status = cc_response.status();
+            let text = cc_response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect::<String>();
+            log_error_body_if_network_lost(&text);
+            eprintln!("[ERROR] CC API returned HTTP {}: {}", status, text);
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                format!("CommandCode API error {}: {}", status, text),
+            )
+                .into_response());
+        }
 
-    for line in text.lines() {
-        if let Some(event) = parse_cc_event_line(line) {
-            match event.event_type.as_str() {
-                "text-delta" => {
-                    if let Some(delta) = event.text {
-                        full_text.push_str(&delta);
+        let bytes = cc_response
+            .bytes()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let text = String::from_utf8_lossy(&bytes);
+
+        if let Some(mut dumper) = CcResponseDumper::new("openai_nonstream", false, &model_id) {
+            dumper.feed_full_body(&text);
+        }
+
+        let mut full_text = String::new();
+        let mut reasoning_text = String::new();
+        let mut tool_calls: Vec<ToolCall> = vec![];
+        let mut usage = Usage::default();
+        let mut finish_reason: Option<String> = None;
+        let mut raw_finish_reason: Option<String> = None;
+        let mut finished = false;
+        let mut has_error = false;
+        let mut error_msg: Option<String> = None;
+
+        for line in text.lines() {
+            if let Some(event) = parse_cc_event_line(line) {
+                match event.event_type.as_str() {
+                    "text-delta" => {
+                        if let Some(delta) = event.text { full_text.push_str(&delta); }
                     }
-                }
-                "reasoning-delta" => {
-                    if let Some(delta) = event.text {
-                        reasoning_text.push_str(&delta);
+                    "reasoning-delta" => {
+                        if let Some(delta) = event.text { reasoning_text.push_str(&delta); }
                     }
-                }
-                "reasoning-end" => {
-                    // reasoning already accumulated
-                }
-                "tool-call" => {
-                    let id = event.tool_call_id.unwrap_or_default();
-                    let name = event.tool_name.unwrap_or_default();
-                    let args = event
-                        .input
-                        .or(event.args)
-                        .or(event.arguments)
-                        .and_then(|v| serde_json::to_string(&v).ok())
-                        .unwrap_or_default();
-                    tool_calls.push(ToolCall {
-                        index: None,
-                        id: Some(id),
-                        tool_type: Some("function".to_string()),
-                        function: Some(ToolCallFunction {
-                            name: Some(name),
-                            arguments: Some(args),
-                        }),
-                    });
-                }
-                "finish" => {
-                    finish_reason = map_finish_reason(event.finish_reason.as_deref());
-                    finished = true;
-                    if let Some(u) = event.total_usage {
-                        usage = usage_from_cc_usage(u);
+                    "reasoning-end" => {}
+                    "tool-call" => {
+                        let id = event.tool_call_id.unwrap_or_default();
+                        let name = event.tool_name.unwrap_or_default();
+                        let args = event
+                            .input
+                            .or(event.args)
+                            .or(event.arguments)
+                            .and_then(|v| serde_json::to_string(&v).ok())
+                            .unwrap_or_default();
+                        tool_calls.push(ToolCall {
+                            index: None,
+                            id: Some(id),
+                            tool_type: Some("function".to_string()),
+                            function: Some(ToolCallFunction {
+                                name: Some(name),
+                                arguments: Some(args),
+                            }),
+                        });
                     }
+                    "finish" => {
+                        raw_finish_reason = event.finish_reason.clone();
+                        finish_reason = map_finish_reason(event.finish_reason.as_deref());
+                        finished = true;
+                        if let Some(u) = event.total_usage {
+                            usage = usage_from_cc_usage(u);
+                        }
+                    }
+                    "error" => {
+                        has_error = true;
+                        error_msg = event
+                            .error
+                            .as_ref()
+                            .and_then(|e| e.get("message").and_then(|m| m.as_str()))
+                            .or_else(|| event.error.as_ref().and_then(|e| e.as_str()))
+                            .map(|s| s.to_string());
+                    }
+                    _ => {}
                 }
-                "error" => {
-                    let msg = event
-                        .error
-                        .as_ref()
-                        .and_then(|e| e.get("message").and_then(|m| m.as_str()))
-                        .or_else(|| event.error.as_ref().and_then(|e| e.as_str()))
-                        .unwrap_or("Stream error");
-                    return Ok((
-                        StatusCode::BAD_GATEWAY,
-                        format!("CommandCode stream error: {}", msg),
-                    )
-                        .into_response());
-                }
-                _ => {}
-            }
-            if finished {
-                break;
+                if finished || has_error { break; }
             }
         }
+
+        if has_error {
+            let msg = error_msg.unwrap_or_else(|| "Stream error".to_string());
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                format!("CommandCode stream error: {}", msg),
+            ).into_response());
+        }
+
+        let has_text = !full_text.trim().is_empty();
+        let has_tool_calls = !tool_calls.is_empty();
+        let has_reasoning = !reasoning_text.is_empty();
+
+        // Success: has visible content or tool calls
+        if has_text || has_tool_calls {
+            let message = ChatCompletionMessage {
+                role: "assistant".to_string(),
+                content: if full_text.is_empty() { None } else { Some(full_text) },
+                reasoning_content: if reasoning_text.is_empty() { None } else { Some(reasoning_text) },
+                tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            };
+
+            let response = ChatCompletionResponse {
+                id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                object: "chat.completion".to_string(),
+                created: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                model: model_id,
+                choices: vec![Choice { index: 0, message, finish_reason }],
+                usage: if usage.total_tokens > 0 { Some(usage) } else { None },
+            };
+            return Ok(axum::Json(response).into_response());
+        }
+
+        // Length recovery: max_tokens truncated — auto-continue up to 3 times
+        if matches!(raw_finish_reason.as_deref(), Some("length") | Some("max_tokens") | Some("max-tokens") | Some("max_output_tokens")) {
+            if length_count < 3 {
+                length_count += 1;
+                eprintln!("[WARN] Output truncated by token cap, auto-continuing ({}/3)", length_count);
+                cc_req.params.messages.push(serde_json::json!({
+                    "role": "user", "content": "Please continue from where you left off."
+                }));
+                continue 'recovery_loop;
+            }
+        }
+
+        // Dangling-intent detection: stop reason but sentence seems incomplete
+        if raw_finish_reason.as_deref() == Some("stop")
+            && intent_count < 2
+            && ends_with_dangling_intent(&reasoning_text)
+        {
+            intent_count += 1;
+            eprintln!("[WARN] Dangling-intent turn, auto-continuing ({}/2)", intent_count);
+            cc_req.params.messages.push(serde_json::json!({
+                "role": "user", "content": "Please continue from where you left off."
+            }));
+            continue 'recovery_loop;
+        }
+
+        // Empty-turn recovery: nudge (inject "Please continue.") up to 2 times
+        if nudge_count < 2 {
+            nudge_count += 1;
+            eprintln!("[WARN] Empty assistant response, nudging ({}/2)", nudge_count);
+            cc_req.params.messages.push(serde_json::json!({
+                "role": "user", "content": "Please continue."
+            }));
+            continue 'recovery_loop;
+        }
+
+        // After nudges, pause up to MAX_EMPTY_TURNS total
+        if nudge_count < MAX_EMPTY_TURNS {
+            nudge_count += 1;
+            eprintln!("[WARN] Empty assistant response, pausing (attempt {})", nudge_count);
+            continue 'recovery_loop;
+        }
+
+        // Exhausted: return reasoning as content or empty
+        eprintln!("[WARN] Exhausted empty-turn recovery, returning empty");
+        let message = ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: if has_reasoning { Some(reasoning_text) } else { Some(String::new()) },
+            reasoning_content: None,
+            tool_calls: None,
+        };
+        let response = ChatCompletionResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: "chat.completion".to_string(),
+            created: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+            model: model_id,
+            choices: vec![Choice { index: 0, message, finish_reason: Some("stop".to_string()) }],
+            usage: if usage.total_tokens > 0 { Some(usage) } else { None },
+        };
+        return Ok(axum::Json(response).into_response());
     }
-
-    let mut message = ChatCompletionMessage {
-        role: "assistant".to_string(),
-        content: if full_text.is_empty() {
-            None
-        } else {
-            Some(full_text)
-        },
-        reasoning_content: if reasoning_text.is_empty() {
-            None
-        } else {
-            Some(reasoning_text)
-        },
-        tool_calls: if tool_calls.is_empty() {
-            None
-        } else {
-            Some(tool_calls)
-        },
-    };
-
-    // If no content and no tool_calls, return empty content to be valid
-    if message.content.is_none() && message.tool_calls.is_none() {
-        message.content = Some(String::new());
-    }
-
-    let response = ChatCompletionResponse {
-        id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-        object: "chat.completion".to_string(),
-        created: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        model: req.model.clone(),
-        choices: vec![Choice {
-            index: 0,
-            message,
-            finish_reason,
-        }],
-        usage: if usage.total_tokens > 0 {
-            Some(usage)
-        } else {
-            None
-        },
-    };
-
-    Ok(axum::Json(response).into_response())
 }
 
 /// Streaming completion handler using SSE.
@@ -467,7 +688,6 @@ pub async fn chat_completions_stream(
     let body = serde_json::to_string(&cc_req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let url = format!("{}/alpha/generate", state.api_base);
-    let session_id = uuid::Uuid::new_v4().to_string();
     let model_id = req.model.clone();
 
     let (tx, rx) =
@@ -479,10 +699,12 @@ pub async fn chat_completions_stream(
         .as_secs() as i64;
 
     tokio::spawn(async move {
-        let mut mid_stream_retries = MAX_RETRIES;
+        let mut mid_stream_retries = MID_STREAM_MAX_RETRIES;
         let mut emitted_visible = false;
 
         'stream_retry: loop {
+            // NEW session_id on every retry to route to different backend
+            let retry_session_id = uuid::Uuid::new_v4().to_string();
             let cc_response = match retry_post_request(
                 || {
                     state
@@ -495,7 +717,7 @@ pub async fn chat_completions_stream(
                         .header("x-project-slug", "commandcode2api")
                         .header("x-taste-learning", "false")
                         .header("x-co-flag", "false")
-                        .header("x-session-id", &session_id)
+                        .header("x-session-id", &retry_session_id)
                         .body(body.clone())
                 },
                 MAX_RETRIES,
@@ -515,8 +737,9 @@ pub async fn chat_completions_stream(
                         break 'stream_retry;
                     }
                     mid_stream_retries -= 1;
-                    let delay = std::time::Duration::from_millis(500 * (1 << (MAX_RETRIES - mid_stream_retries)));
-                    eprintln!("[WARN] OpenAI stream POST failed, retrying in {:?}...", delay);
+                    let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                    let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                    eprintln!("[WARN] OpenAI stream POST failed, retrying #{retry_n} in {:?}...", delay);
                     tokio::time::sleep(delay).await;
                     continue 'stream_retry;
                 }
@@ -546,10 +769,15 @@ pub async fn chat_completions_stream(
                     break 'stream_retry;
                 }
                 mid_stream_retries -= 1;
-                let delay = std::time::Duration::from_millis(500 * (1 << (MAX_RETRIES - mid_stream_retries)));
-                eprintln!("[WARN] Retrying OpenAI stream POST after HTTP {} in {:?}...", status, delay);
+                let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                eprintln!("[WARN] Retrying OpenAI stream POST after HTTP {} #{retry_n} in {:?}...", status, delay);
                 tokio::time::sleep(delay).await;
                 continue 'stream_retry;
+            }
+
+            if mid_stream_retries < MID_STREAM_MAX_RETRIES {
+                eprintln!("[INFO] OpenAI stream retry succeeded, reading started");
             }
 
             let mut buf = String::new();
@@ -558,9 +786,17 @@ pub async fn chat_completions_stream(
             let mut sent_role = false;
             let mut reasoning_buf = String::new();
             let mut stream_success = false;
+            let mut has_text_content = false;
+            let mut has_tool_calls = false;
+            let mut chunk_dumper = CcResponseDumper::new("openai_stream", true, &model_id);
+            let chunk_timeout = std::time::Duration::from_secs(CHUNK_TIMEOUT_SECS);
             'read_stream: loop {
-                match byte_stream.next().await {
-                    Some(Ok(chunk)) => {
+                let next_chunk = tokio::time::timeout(chunk_timeout, byte_stream.next()).await;
+                match next_chunk {
+                    Ok(Some(Ok(chunk))) => {
+                        if let Some(ref mut d) = chunk_dumper {
+                            d.feed_bytes(&chunk);
+                        }
                         buf.push_str(&String::from_utf8_lossy(&chunk));
 
                         while let Some(pos) = buf.find('\n') {
@@ -571,6 +807,7 @@ pub async fn chat_completions_stream(
                                 match event.event_type.as_str() {
                                     "text-delta" => {
                                         emitted_visible = true;
+                                        has_text_content = true;
                                         if !sent_role {
                                             let _ = tx
                                                 .send(Ok(chunk_event(
@@ -634,6 +871,7 @@ pub async fn chat_completions_stream(
                                     "reasoning-end" => {}
                                     "tool-call" => {
                                         emitted_visible = true;
+                                        has_tool_calls = true;
                                         let id = event.tool_call_id.unwrap_or_default();
                                         let name = event.tool_name.unwrap_or_default();
                                         let args = event
@@ -669,6 +907,24 @@ pub async fn chat_completions_stream(
                                         tool_call_idx += 1;
                                     }
                                     "finish" => {
+                                        if !has_text_content && !has_tool_calls && !reasoning_buf.is_empty() {
+                                            let _ = tx
+                                                .send(Ok(chunk_event(
+                                                    &completion_id,
+                                                    created,
+                                                    &model_id,
+                                                    0,
+                                                    ChunkDelta {
+                                                        role: None,
+                                                        content: Some(reasoning_buf.clone()),
+                                                        reasoning_content: None,
+                                                        tool_calls: None,
+                                                    },
+                                                    None,
+                                                    None,
+                                                )))
+                                                .await;
+                                        }
                                         let finish_reason = map_finish_reason(event.finish_reason.as_deref());
                                         let usage = event
                                             .total_usage
@@ -706,15 +962,27 @@ pub async fn chat_completions_stream(
                             }
                         }
                     }
-                    Some(Err(e)) => {
+                    Ok(Some(Err(e))) => {
                         eprintln!(
                             "[ERROR] OpenAI stream read error (retries left: {}, emitted_visible: {}): {}",
                             mid_stream_retries, emitted_visible, e
                         );
-                        if !emitted_visible && mid_stream_retries > 0 {
+                        if emitted_visible {
+                            let _ = tx
+                                .send(Ok(chunk_event(
+                                    &completion_id, created, &model_id, 0,
+                                    ChunkDelta::default(),
+                                    Some("stop".to_string()),
+                                    None,
+                                )))
+                                .await;
+                            break 'stream_retry;
+                        }
+                        if mid_stream_retries > 0 {
                             mid_stream_retries -= 1;
-                            let delay = std::time::Duration::from_millis(500 * (1 << (MAX_RETRIES - mid_stream_retries)));
-                            eprintln!("[WARN] Retrying OpenAI stream in {:?}...", delay);
+                            let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                            let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                            eprintln!("[WARN] Retrying OpenAI stream read #{retry_n} in {:?}...", delay);
                             tokio::time::sleep(delay).await;
                             continue 'stream_retry;
                         }
@@ -728,10 +996,29 @@ pub async fn chat_completions_stream(
                             .await;
                         break 'stream_retry;
                     }
-                    None => {
+                    Ok(None) => {
+                        // Process remaining data in buffer before finishing
                         if !buf.is_empty() {
                             if let Some(event) = parse_cc_event_line(&buf) {
                                 if event.event_type == "finish" {
+                                    if !has_text_content && !has_tool_calls && !reasoning_buf.is_empty() {
+                                        let _ = tx
+                                            .send(Ok(chunk_event(
+                                                &completion_id,
+                                                created,
+                                                &model_id,
+                                                0,
+                                                ChunkDelta {
+                                                    role: None,
+                                                    content: Some(reasoning_buf.clone()),
+                                                    reasoning_content: None,
+                                                    tool_calls: None,
+                                                },
+                                                None,
+                                                None,
+                                            )))
+                                            .await;
+                                    }
                                     let finish_reason = map_finish_reason(event.finish_reason.as_deref());
                                     let usage = event
                                         .total_usage
@@ -754,6 +1041,41 @@ pub async fn chat_completions_stream(
                         }
                         break 'read_stream;
                     }
+                    Err(_elapsed) => {
+                        eprintln!(
+                            "[ERROR] OpenAI stream chunk timeout after {}s (retries left: {}, emitted_visible: {}, buf_remaining: {})",
+                            CHUNK_TIMEOUT_SECS, mid_stream_retries, emitted_visible, buf.len()
+                        );
+                        if emitted_visible {
+                            let _ = tx
+                                .send(Ok(chunk_event(
+                                    &completion_id, created, &model_id, 0,
+                                    ChunkDelta::default(),
+                                    Some("stop".to_string()),
+                                    None,
+                                )))
+                                .await;
+                            break 'stream_retry;
+                        }
+                        if !buf.is_empty() {
+                            eprintln!("[WARN] OpenAI stream partial buffer on timeout: {}", buf.chars().take(200).collect::<String>());
+                        }
+                        if mid_stream_retries > 0 {
+                            mid_stream_retries -= 1;
+                            let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                            let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                            eprintln!("[WARN] Retrying OpenAI stream after chunk timeout #{retry_n} in {:?}...", delay);
+                            tokio::time::sleep(delay).await;
+                            continue 'stream_retry;
+                        }
+                        let _ = tx
+                            .send(Ok(error_event(
+                                &completion_id, created, &model_id,
+                                &format!("Stream timed out after {}s", CHUNK_TIMEOUT_SECS),
+                            )))
+                            .await;
+                        break 'stream_retry;
+                    }
                 }
 
             }
@@ -764,18 +1086,31 @@ pub async fn chat_completions_stream(
 
             if mid_stream_retries > 0 {
                 mid_stream_retries -= 1;
-                let delay = std::time::Duration::from_millis(500 * (1 << (MAX_RETRIES - mid_stream_retries)));
-                eprintln!("[WARN] OpenAI stream ended without finish, retrying in {:?}...", delay);
+                let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                eprintln!("[WARN] OpenAI stream ended without finish, retrying #{retry_n} in {:?}...", delay);
                 tokio::time::sleep(delay).await;
                 continue 'stream_retry;
             }
 
-            let _ = tx
-                .send(Ok(error_event(
-                    &completion_id, created, &model_id,
-                    "Stream ended unexpectedly after all retries",
-                )))
-                .await;
+            // All retries exhausted: graceful end if we emitted content
+            if emitted_visible {
+                let _ = tx
+                    .send(Ok(chunk_event(
+                        &completion_id, created, &model_id, 0,
+                        ChunkDelta::default(),
+                        Some("stop".to_string()),
+                        None,
+                    )))
+                    .await;
+            } else {
+                let _ = tx
+                    .send(Ok(error_event(
+                        &completion_id, created, &model_id,
+                        "Stream ended unexpectedly after all retries",
+                    )))
+                    .await;
+            }
             break 'stream_retry;
         }
 
@@ -970,6 +1305,11 @@ async fn messages_non_streaming(
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     let text = String::from_utf8_lossy(&bytes);
 
+    // Dump raw CC response
+    if let Some(mut dumper) = CcResponseDumper::new("anthropic_nonstream", false, &original_model) {
+        dumper.feed_full_body(&text);
+    }
+
     let mut full_text = String::new();
     let mut reasoning_text = String::new();
     let mut tool_calls: Vec<ToolCall> = vec![];
@@ -1055,6 +1395,12 @@ async fn messages_non_streaming(
     if message.content.is_none() && message.tool_calls.is_none() {
         message.content = Some(String::new());
     }
+    if message.tool_calls.is_none()
+        && message.content.as_deref().map_or(true, |c| c.is_empty())
+        && message.reasoning_content.as_deref().map_or(false, |r| !r.is_empty())
+    {
+        message.content = message.reasoning_content.take();
+    }
 
     let openai_resp = ChatCompletionResponse {
         id: format!("msg_{}", uuid::Uuid::new_v4()),
@@ -1111,7 +1457,6 @@ async fn messages_stream(
     let body = serde_json::to_string(&cc_req).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let url = format!("{}/alpha/generate", state.api_base);
-    let session_id = uuid::Uuid::new_v4().to_string();
 
     let (tx, rx) =
         mpsc::channel::<Result<axum::response::sse::Event, std::convert::Infallible>>(128);
@@ -1122,10 +1467,12 @@ async fn messages_stream(
     let state = state.clone();
 
     tokio::spawn(async move {
-        let mut mid_stream_retries = MAX_RETRIES;
+        let mut mid_stream_retries = MID_STREAM_MAX_RETRIES;
         let mut emitted_visible = false;
 
         'stream_retry: loop {
+            // NEW session_id on every retry to route to different backend
+            let retry_session_id = uuid::Uuid::new_v4().to_string();
             let cc_response = match retry_post_request(
                 || {
                     state
@@ -1138,7 +1485,7 @@ async fn messages_stream(
                         .header("x-project-slug", "commandcode2api")
                         .header("x-taste-learning", "false")
                         .header("x-co-flag", "false")
-                        .header("x-session-id", &session_id)
+                        .header("x-session-id", &retry_session_id)
                         .body(body.clone())
                 },
                 MAX_RETRIES,
@@ -1161,8 +1508,9 @@ async fn messages_stream(
                         break 'stream_retry;
                     }
                     mid_stream_retries -= 1;
-                    let delay = std::time::Duration::from_millis(500 * (1 << (MAX_RETRIES - mid_stream_retries)));
-                    eprintln!("[WARN] Retrying Anthropic stream POST in {:?}...", delay);
+                    let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                    let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                    eprintln!("[WARN] Retrying Anthropic stream POST #{retry_n} in {:?}...", delay);
                     tokio::time::sleep(delay).await;
                     continue 'stream_retry;
                 }
@@ -1192,10 +1540,15 @@ async fn messages_stream(
                     break 'stream_retry;
                 }
                 mid_stream_retries -= 1;
-                let delay = std::time::Duration::from_millis(500 * (1 << (MAX_RETRIES - mid_stream_retries)));
-                eprintln!("[WARN] Retrying Anthropic stream POST after HTTP {} in {:?}...", status, delay);
+                let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                eprintln!("[WARN] Retrying Anthropic stream POST after HTTP {} #{retry_n} in {:?}...", status, delay);
                 tokio::time::sleep(delay).await;
                 continue 'stream_retry;
+            }
+
+            if mid_stream_retries < MID_STREAM_MAX_RETRIES {
+                eprintln!("[INFO] Anthropic stream retry succeeded, reading started");
             }
 
             let mut buf = String::new();
@@ -1208,10 +1561,16 @@ async fn messages_stream(
             let mut sent_role = false;
             let mut reasoning_buf = String::new();
             let mut stream_success = false;
+            let mut chunk_dumper = CcResponseDumper::new("anthropic_stream", true, &original_model);
+            let chunk_timeout = std::time::Duration::from_secs(CHUNK_TIMEOUT_SECS);
 
             'read_stream: loop {
-                match byte_stream.next().await {
-                    Some(Ok(chunk)) => {
+                let next_chunk = tokio::time::timeout(chunk_timeout, byte_stream.next()).await;
+                match next_chunk {
+                    Ok(Some(Ok(chunk))) => {
+                        if let Some(ref mut d) = chunk_dumper {
+                            d.feed_bytes(&chunk);
+                        }
                         buf.push_str(&String::from_utf8_lossy(&chunk));
 
                         while let Some(pos) = buf.find('\n') {
@@ -1373,15 +1732,16 @@ async fn messages_stream(
                             }
                         }
                     }
-                    Some(Err(e)) => {
+                    Ok(Some(Err(e))) => {
                         eprintln!(
                             "[ERROR] Anthropic stream read error (retries left: {}, emitted_visible: {}): {}",
                             mid_stream_retries, emitted_visible, e
                         );
                         if !emitted_visible && mid_stream_retries > 0 {
                             mid_stream_retries -= 1;
-                            let delay = std::time::Duration::from_millis(500 * (1 << (MAX_RETRIES - mid_stream_retries)));
-                            eprintln!("[WARN] Retrying Anthropic stream in {:?}...", delay);
+                            let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                            let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                            eprintln!("[WARN] Retrying Anthropic stream read #{retry_n} in {:?}...", delay);
                             tokio::time::sleep(delay).await;
                             continue 'stream_retry;
                         }
@@ -1395,7 +1755,7 @@ async fn messages_stream(
                         let _ = tx.send(Ok(anthropic_sse_event(&ev))).await;
                         break 'stream_retry;
                     }
-                    None => {
+                    Ok(None) => {
                         if !buf.is_empty() {
                             if let Some(event) = parse_cc_event_line(&buf) {
                                 if event.event_type == "finish" {
@@ -1424,6 +1784,32 @@ async fn messages_stream(
                             }
                         }
                         break 'read_stream;
+                    }
+                    Err(_elapsed) => {
+                        eprintln!(
+                            "[ERROR] Anthropic stream chunk timeout after {}s (retries left: {}, emitted_visible: {}, buf_remaining: {})",
+                            CHUNK_TIMEOUT_SECS, mid_stream_retries, emitted_visible, buf.len()
+                        );
+                        if !buf.is_empty() {
+                            eprintln!("[WARN] Anthropic stream partial buffer on timeout: {}", buf.chars().take(200).collect::<String>());
+                        }
+                        if !emitted_visible && mid_stream_retries > 0 {
+                            mid_stream_retries -= 1;
+                            let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                            let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                            eprintln!("[WARN] Retrying Anthropic stream after chunk timeout #{retry_n} in {:?}...", delay);
+                            tokio::time::sleep(delay).await;
+                            continue 'stream_retry;
+                        }
+                        let ev = translate_api::MessageEvent::MessageDelta {
+                            delta: translate_api::MessageDeltaInfo {
+                                stop_reason: "end_turn".to_string(),
+                                stop_sequence: None,
+                            },
+                            usage: None,
+                        };
+                        let _ = tx.send(Ok(anthropic_sse_event(&ev))).await;
+                        break 'stream_retry;
                     }
                 }
             }
@@ -1465,8 +1851,9 @@ async fn messages_stream(
 
             if !emitted_visible && mid_stream_retries > 0 {
                 mid_stream_retries -= 1;
-                let delay = std::time::Duration::from_millis(500 * (1 << (MAX_RETRIES - mid_stream_retries)));
-                eprintln!("[WARN] Anthropic stream ended without finish, retrying in {:?}...", delay);
+                let delay = std::time::Duration::from_millis(500 * (1 << (MID_STREAM_MAX_RETRIES - mid_stream_retries)));
+                let retry_n = MID_STREAM_MAX_RETRIES - mid_stream_retries;
+                eprintln!("[WARN] Anthropic stream ended without finish, retrying #{retry_n} in {:?}...", delay);
                 tokio::time::sleep(delay).await;
                 continue 'stream_retry;
             }

@@ -21,6 +21,20 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Clear old dump data on startup
+    let data_dir = "data";
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        tracing::info!("Cleared data/ contents");
+    }
+
     let api_base = env::var("COMMANDCODE_API_BASE")
         .unwrap_or_else(|_| "https://api.commandcode.ai".to_string());
     let default_api_key = env::var("COMMANDCODE_API_KEY").ok();
